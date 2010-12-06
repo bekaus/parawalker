@@ -464,7 +464,7 @@ The directory names may be specified by a format string with the following speci
 
     %%     The % character.
 
-A option may be set to ensure unique directory names. In that case, six additional unique
+An option may be set to ensure unique directory names. In that case, six additional unique
 characters are added to the directory names. The uniqueness is guaranteed.
 
 A result overview may be saved in a file. Every line contains the return-value of the process, an id
