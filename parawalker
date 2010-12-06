@@ -1,0 +1,507 @@
+#!/usr/bin/env python
+ #
+ # parawalker
+ #
+ # Copyright (c) 2009 Bernhard Kausler <bernhard.kausler@iwr.uni-heidelberg.de>
+ #
+
+from __future__ import with_statement # This isn't required in Python 2.6
+
+import itertools
+import logging
+import optparse 
+import time
+import Queue
+import subprocess
+import sys
+import threading
+import warnings
+import csv
+import errno
+import inspect
+import os
+import os.path
+import tempfile
+import re
+import threading
+import time
+
+class Command:
+    """Decouples initialization and execution of a Popen subprocess."""
+    def __init__(self, identifier=None, stdinPath=None, stdoutPath=None, stderrPath=None, popenargs=(), popenkwargs={}, filemode='a'):
+        """Constructor.
+
+        Pathes to redirect the stdstreams to files can be set. These files are opened/closed with the class'
+        corresponding functions. They then overwrite possible stdin. stdout and stderr parameters to
+        Popen. Filemode will used for opening the files.
+        
+        Image, that you initialize several Command object for later use. It is a bad idea to give them all open
+        file descriptors. The mechanism described in the last paragraph is a mean to prevent that.
+
+        popenargs   Arguments for the underlying subprocess.Popen
+        popenkwargs
+
+        identifier  A user defined id for the Command.
+        """
+        self.id = identifier
+        self.popenargs = popenargs
+        self.popenkwargs = popenkwargs
+        self.stdinPath = stdinPath
+        self.stdoutPath = stdoutPath
+        self.stderrPath = stderrPath
+        self.filemode = filemode
+
+        self.redirectFilesOpen = False
+
+    def openRedirectFiles(self):
+        '''Opens the files specified before.
+
+        If one or more of the stdxxxPath member variables is set, this function will open them
+        and will override the corresponding parameters stdxxx in the member variable popenkwargs.
+        Command.filemode controls the flags for opening the file.
+        '''
+        if self.stdinPath != None:
+            self.inFd = file(self.stdinPath, self.filemode)
+            if len(self.popenargs) > self.__stdinArgPos:
+                temp = list(self.popenargs)
+                temp[self.__stdinArgPos] = self.inFd
+                self.popenargs = tuple(temp)
+            else:
+                self.popenkwargs["stdin"] = self.inFd        
+        if self.stdoutPath != None:
+            self.outFd = file(self.stdoutPath, self.filemode)
+            if len(self.popenargs) > self.__stdoutArgPos:
+                temp = list(self.popenargs)
+                temp[self.__stdoutArgPos] = self.outFd
+                self.popenargs = tuple(temp)
+            else:
+                self.popenkwargs["stdout"] = self.outFd
+        if self.stderrPath != None:
+            self.errFd = file(self.stderrPath, self.filemode)
+            if len(self.popenargs) > self.__stderrArgPos:
+                temp = list(self.popenargs)
+                temp[self.__stderrArgPos] = self.errFd
+                self.popenargs = tuple(temp)
+            else:
+                self.popenkwargs["stderr"] = self.errFd
+        self.redirectFilesOpen = True
+
+    def closeRedirectFiles(self):
+        if self.redirectFilesOpen != True:
+            warnings.warn("Attempted to close redirect files before opening them. Request ignored.")
+            return
+
+        if self.stdinPath != None:
+            self.inFd.close()        
+        if self.stdoutPath != None:
+            self.outFd.close()
+        if self.stderrPath != None:
+            self.errFd.close()
+
+    def popen(self, ):
+        '''Creates and returns a new subprocess.Popen object.
+
+        Popen is called with popenargs and kwargs.
+        Throws the same exceptions as Popen.
+        '''
+        proc = subprocess.Popen(*self.popenargs, **self.popenkwargs)
+        return proc
+
+    # Popen argument positions (count starting at 0)
+    __stdinArgPos = 3
+    __stdoutArgPos = 4
+    __stderrArgPos = 5
+
+
+
+class ConcurrentCommands:
+    """Executes Commands as parallel processes."""
+    def __init__(self, name="", numberOfProcesses = 2):
+        '''Constructor.
+ 
+        name is used to id the associated threads -> "concurrent_command_name_count"
+        numberOfProcesses are the maximal number of parallel processes.
+        '''
+        self.__name = name
+        self.__numberOfProcesses = numberOfProcesses
+
+    def execute(self, iterableOfCommands):
+        '''Executes a bunch of Commands.
+
+        Returns a sequence of tuples, where one tuple is:
+        (return value, id of Command, args parameter of Command, working directory)
+
+        For example: (0, 723, ("ls", "-l"), "/mydir/workingdir")
+
+        If the Command raised an exception during execution, the return value
+        is set to "exception_thrown". This happens, if the command to be
+        executed can't be found (wrong path etc.) or when the wrong popen arguments in
+        Command are given.       
+        '''
+        # Has to be a local class, because we want it to lose its state after the
+        # function terminates.
+        class Executor(threading.Thread):          
+            commandQueue = Queue.Queue()
+            resultQueue = Queue.Queue()
+            dieEvent = threading.Event()
+            exceptionRetVal = "exception_thrown"
+
+            def run(self):
+                while self.dieEvent.isSet() == False:
+                    try:
+                        command = self.commandQueue.get_nowait()
+                    except Queue.Empty:
+                        continue
+                    try:
+                        command.openRedirectFiles()
+                        retval = command.popen().wait()
+                        command.closeRedirectFiles()
+                    except:
+                        retval = self.exceptionRetVal
+                        msg = "Popen failed: "  + str(command.popenargs) + ", " + str(command.popenkwargs) + ", " + str(sys.exc_info())
+                        logging.error(msg)
+                    cmd = command.popenkwargs.get("args")
+                    if cmd is None:
+                        cmd = command.popenargs
+                    cwd = command.popenkwargs.get("cwd")
+                    if cwd is None:
+                        cwd = "#unknown"
+                    ident = command.id
+                    self.resultQueue.put((retval, ident) + cmd + (cwd,))         
+                    self.commandQueue.task_done()
+                    logging.info("Finished command (Id: "+str(ident)+"): " +str(retval) + " <-- '"  + " ".join(cmd[0]) + "'")
+
+        # Start Executor threads
+        for i in xrange(self.getNumberOfProcesses()): 
+            t = Executor(name="concurrent_command_" + self.getName() + "_" + str(i))
+            # Further below, we WILL kill the threads manually.
+            # We set them daemon here to prevent an application blocking, if the main thread crashes            
+            t.setDaemon(True)
+            t.start() 
+        
+        # Feed the Executors with Commands
+        for command in iterableOfCommands:
+            Executor.commandQueue.put(command)
+
+        # Wait for the Executors to finish their jobs and then kill them
+        Executor.commandQueue.join()
+        Executor.dieEvent.set()
+
+        # Prepare and return the results
+        results = []
+        while Executor.resultQueue.empty() != True:
+            results.append(Executor.resultQueue.get())
+        return results
+
+    def setName(self, name):
+        self.__name = name
+    def getName(self):
+        return self.__name
+
+    def setNumberOfProcesses(self, number):
+        self.__numberOfProcesses = number
+    def getNumberOfProcesses(self):
+        return self.__numberOfProcesses
+
+class Commandlines:
+    """Executing a number of commandlines in a parallel way.
+
+    Example for a commandline: "ls -l -isah"
+    """
+    def __init__(self, iterableOfCommandlines, rootDir, WorkingDir, uniqueWorkingDirs = False, directory_permissions = 0700):
+        '''Constructor.
+        
+        iterableOfCommandlines is an iterable like a list or a open File. Each element of
+        the iterable has to be a commandline of the form "ls -l -isah".
+
+        The commandlines get executed in the directories named by the WorkingDir-iterator.
+        If uniqueWorkingDirs is true, the uniqueness of these directories is ensured by 
+        appending six random characters to the pathname. The directories are relative to rootDir.
+        
+        directory_permissions contains the filesystem permissions of the working directories.
+        If unique directories are demanded, the permissions are fixed to
+        0700 due to the underlying mechanism ensuring the uniqueness. In that case, the user
+        permissions set by the user are ignored.
+
+        An example for a unique working directory is "cmd_2009-10-30_mycommand_DWFKAc".
+
+        The WorkingDir iterator may provide a method "setVolatile(string)". During executing
+        the commandlines, the volatile will be set to the name of the associated binary before
+        retrieving the next pathname from WorkingDir. It is not mandatory to implement this method.
+
+        The same is true for "setVolatileInt(string)". It will be set to the Id of the current command.
+        '''
+        self.iterableOfCommandlines = iterableOfCommandlines
+        self.rootDir = rootDir
+        self.WorkingDir = WorkingDir
+        self.uniqueWorkingDirs = uniqueWorkingDirs
+ 
+        self.stdoutRedirectFilename = "output.log"
+        self.stderrRedirectFilename = "error.log"
+        self.dir_permissions = directory_permissions
+
+    def execute(self, numberOfProcesses=2):
+        '''Execute the commandlines in a parallel way.
+
+        numberOfProcesses is the number of concurrent executed commandlines. Directly
+        before execution a new directory is created and the working path is set to
+        this directory. Output from the process to stdout and stderr is redirected to
+        output.log and error.log in the same directory.
+
+        Commandlines.dir_permissions controls the file system permissions of that directory.
+        The default is 0700. If unique directories are demanded, the permissions are fixed to
+        0700 due to the underlying mechanism ensuring the uniqueness. In that case, the user
+        set permissions are ignored.
+
+        Returns a sequence of tuples, where one tuple is:
+        (return value, id of Command, args parameter of Command, working directory)
+
+        For example: (0, 723, ("ls", "-l"), "/mydir/workingdir")
+
+        If the Command raised an exception during execution, the return value
+        is set to "exception_thrown". This happens, if the command to be
+        executed can't be found (wrong path etc.) or when the wrong popen arguments in
+        Command are given.  
+        '''
+        commands = self.__generateCommands()
+        cc = ConcurrentCommands(numberOfProcesses=numberOfProcesses)
+        return cc.execute(commands)
+
+    def __mkdirIf(self, path):
+        try:
+            os.mkdir(path, self.dir_permissions)
+        except OSError, e:
+            # no problem if directory already exists, since uniqueness was not demanded by user
+            if e.errno != errno.EEXIST:
+                raise
+
+
+    def __generateCommands(self):
+        '''Encapsulates commandlines in Command objects.
+        
+        Returns an iterator to the Command objects.
+        '''
+        cmdLineReader = csv.reader(self.iterableOfCommandlines, delimiter=',')
+        count = 0
+        for args in cmdLineReader:
+            count += 1
+            cmdElements = args[0].split()
+ 
+            # check, if we have a manual relative working dir overwrite
+            if(len(args) == 2):
+                workpath = os.path.normpath(args[1].strip())
+                workpath = os.path.normcase(workpath)
+                self.__mkdirIf(workpath)
+
+            # else, create relative working dir automatically
+            else:
+                # tell the WorkingDir iterator the binary name, if possible
+                binaryName =  os.path.split(str(cmdElements[0]))[1]
+                if(getattr(self.WorkingDir, "setVolatile", None) != None and inspect.ismethod(self.WorkingDir.setVolatile)):
+                    self.WorkingDir.setVolatile(binaryName)
+                if(getattr(self.WorkingDir, "setVolatileInt", None) != None and inspect.ismethod(self.WorkingDir.setVolatileInt)):
+                    self.WorkingDir.setVolatileInt(count)
+                relativeWorkpath = self.WorkingDir.next()
+
+                # create the working directory
+                if(self.uniqueWorkingDirs == True):
+                    workpath = tempfile.mkdtemp("", relativeWorkpath, self.rootDir)
+                else:
+                    workpath = os.path.join(self.rootDir, relativeWorkpath)
+                    self.__mkdirIf(workpath)
+
+            # construct a command living in the working directory
+            outPath = os.path.join(workpath, self.stdoutRedirectFilename)
+            errPath = os.path.join(workpath, self.stderrRedirectFilename)
+
+            yield Command(identifier = count, stdoutPath = outPath, stderrPath = errPath, popenargs=(cmdElements,), popenkwargs={"cwd": workpath})
+
+def _idSequence(startAt = 1, width = 5):
+    """Fixed width numbers as strings.
+    
+    Restarts at startAt, when exceeding the maximal size of the number.
+    Zeros are padded, if necessary to reach the full width. 
+    
+    Returns an iterator.
+
+    For example:
+    id = _idSequence(7, width = 1)
+    returns an infinite seq.: "7, 8, 9, 7, 8, 9, 7 ..."
+    """
+    maxSize = (10**width) - 1
+    iterations = (maxSize - startAt) + 1    
+    counter = itertools.count()    
+
+    while True:
+        yield ("%0" + str(width) + "u") % ((counter.next() % iterations) + startAt)
+
+
+
+class WorkingDir:
+    """Generates pathnames for working dirs.
+
+    format is an arbitrary string with the following special modifiers:
+    
+    %idn*w An upcounting integer id with absolute width w, starting at n.
+           Restarts at n, if max. size is exceeded.
+           For example: %id1*2 is the sequence from 01 to 99, looping again and again.
+    
+    %d    The current datetime. Defaults to "2009-11-30". By manipulating WorkingDir.datetimefmt,
+          the user can set his own format using standard time.strftime syntax.
+    
+    %v    Set WorkingDir.volatile to influence the generated string dynamically after
+          specifying the format. Defaults to "".
+
+    %iv*w   WorkingDir.volatileInt has to be an integer. Will expand to a fixed width w; 
+            padded with zeros. Defaults to 0.
+
+    %%    The % character.
+
+    WorkingDir is an iterator.
+    """
+    def __init__(self, format="cmd_%d_%id1*5"):
+        # initialize the lock first in any case
+        self.__rlock = threading.RLock()
+
+        self.__datetimefmt = "%Y-%m-%d"
+        self.__volatile = ""
+        self.__volatileInt = 0
+        self.setFormat(format)
+
+    
+    def __iter__(self):
+        return self
+
+    def next(self):
+        with self.__rlock:
+            idGenIter = self.__ids.__iter__()
+            volIntsWidthIter = self.__volInts.__iter__()
+
+            def modifierExpansion(match):
+                idn, datetime, volatile, volatileInt, percChar = match.groups()
+                if idn:
+                    try:
+                        idGenerator = idGenIter.next()
+                        return idGenerator.next()
+                    except StopIteration: 
+                        return idn 
+                elif datetime: return time.strftime(self.__datetimefmt)
+                elif volatile: return self.__volatile
+                elif volatileInt:
+                    try:
+                        width = volIntsWidthIter.next()
+                        fixed = self.__volatileInt % (10**width)                           
+                        return ("%0" + str(width) + "u") % fixed
+                    except StopIteration:
+                        return volatileInt
+                elif percChar: return "%"
+            return re.sub(self.__modifiersRe, modifierExpansion, self.getFormat())
+
+    def setFormat(self, format):
+        with self.__rlock:
+            self.__format = format
+
+            # setup up the id counters
+            idModifiers = re.finditer(self.__idRe, format)
+            self.__ids = []
+            for idMod in idModifiers:
+                startAt, width = idMod.groups()
+                self.__ids.append(_idSequence(int(startAt), int(width)))
+
+            # setup the volatile2 integer with padding
+            volIntModifiers = re.finditer(self.__volIntRe, format)
+            self.__volInts = []
+            for volIntMod in volIntModifiers:
+                width = volIntMod.groups()
+                self.__volInts.append(int(width[0]))
+
+    def getFormat(self):
+        return self.__format
+
+    def setDatetimeFormat(self, datetimefmt):
+        with self.__rlock:
+            self.__datetimefmt = datetimefmt
+    def getDatetimeFormat(self):
+        return self.__datetimefmt
+
+    def setVolatile(self, volatile):
+        with self.__rlock:
+            self.__volatile = volatile
+    def getVolatile(self):
+        return self.__volatile
+
+    def setVolatileInt(self, integer):
+        with self.__rlock:
+            self.__volatileInt = integer
+    def getVolatileInt(self):
+        return self.__volatileInt
+
+    __idRe = re.compile(r"%id(\d+)\*(\d+)")
+    __volIntRe = re.compile(r"%iv\*(\d+)")
+    __modifiersRe = re.compile(r"(%id\d+\*\d+)|(%d)|(%v)|(%iv\*\d+)|(%%)")
+
+if __name__ == '__main__':
+    # option parser
+    usage = """%prog [options] FILE [DEST]
+Walks through the commandlines in FILE and executes them.
+Every line has to contain a valid commandline (no whitespace, comments etc.).
+
+The commandlines are executed in newly created directories relative to DEST (default '.').
+The directory names may be specified by a format string with the following special modifiers:
+
+    %idn*w An upcounting integer id with exactly w characters, starting at n. A padding with
+           zeros is done to ensure the width.
+           Restarts at n, if the id doesn't fit into w characters anymore.
+           For example: %id1*2 is the sequence from 01 to 99, looping again and again.
+    
+    %d     The current date. For example: "2009-11-30".
+    
+    %v     The name of the current binary. For example "ls" for the command "/bin/ls -l -si"
+
+    %iv*w  The id of the current commandline with a fixed width w (padded with zeros).
+           It w is too small, it may overflow and restart at 0. Be careful.
+           The first commandline has id 1. The id is increased by one for every following commandline.
+
+    %%     The % character.
+
+A option may be set to ensure unique directory names. In that case, six additional unique
+characters are added to the directory names. The uniqueness is guaranteed.
+
+A result overview may be saved in a file. Every line contains the return-value of the process, an id
+in order of the input commands starting at 1, the commandline itself and its relative working directory. The return-value is either an integer
+or "exception_thrown". The latter is returned, when the commandline is malformed or the command is not found.
+"""
+    parser = optparse.OptionParser(usage=usage)
+    parser.add_option("-n", "--number-of-processes", type="int", dest="procs", default=2, help="number of parallel executed commandlines [default: %default]")
+    parser.add_option("-f", "--working-dir-format", dest="workdirfmt", default="cmd_%d_%id1*6_%v", help="format-string for the output directories [default: %default]")
+    parser.add_option("-u", "--unique-working-dirs", dest="unique_working_dirs", action="store_true", default=False, help="ensure uniqueness of the output directories [default: %default]")
+    parser.add_option("-o", dest="resultdest", help="store a result overview in file RESULTDEST")
+
+    options, args = parser.parse_args()
+
+    numArgs = len(args)
+    if numArgs is 1:
+        cmdlinesFile = args[0]
+        rootDir = "."
+
+    elif numArgs is 2:
+        cmdlinesFile = args[0]
+        rootDir = args[1]
+    else:
+        parser.print_help()
+        sys.exit(1)
+    
+    # configure logging
+    logging.basicConfig(level=logging.INFO, \
+                        format='%(asctime)s %(levelname)-8s %(message)s', \
+                        datefmt='%Y-%m-%d %H:%M:%S')
+
+    workingDirs = WorkingDir(format = options.workdirfmt)
+
+    with open(cmdlinesFile, 'r') as cmds:
+        cls = Commandlines(cmds, rootDir, workingDirs, options.unique_working_dirs)
+        results = cls.execute(numberOfProcesses=options.procs)    
+    
+    if options.resultdest != None:
+        with open(options.resultdest, 'w') as r:
+            r.writelines(itertools.imap(lambda x: str(x[0])+", "+str(x[1])+", "+" ".join(x[2])+", "+x[3]+"\n", results)) 

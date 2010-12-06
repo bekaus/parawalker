@@ -1,0 +1,5 @@
+ls -lisl
+ls -1234
+ls
+ls -l -isah, ./my_own_directory
+bratzblub bla
